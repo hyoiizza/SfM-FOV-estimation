@@ -8,12 +8,69 @@ import torch
 from math import ceil, log
 import itertools
 from scipy.spatial.transform import Rotation as Rscipy
-
-
+import matplotlib.pyplot as plt
 
 # OpenCV의 KMP 라이브러리 중복 로딩 방지
 import os
 os.environ['KMP_DUPLICATE_LIB_OK']='True'
+
+#==================================유틸리티=================================
+# 테이블 시각화 및 저장
+def save_table_heatmap(table, save_path):
+    plt.figure(figsize=(8, 6))
+    plt.imshow(table, cmap='hot', interpolation='nearest', origin='upper',aspect='auto')
+    plt.colorbar(label='Keypoint Count')
+    plt.title('Grid Keypoint Count Heatmap')
+    plt.xlabel('Grid Col')
+    plt.ylabel('Grid Row')
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
+
+# 행렬 E 계산
+def compute_E(F: np.ndarray, K: np.ndarray) -> np.ndarray:
+    """
+    Compute Essential matrix from Fundamental matrix and camera intrinsics.
+    
+    Args:
+        F (np.ndarray): Fundamental matrix (3x3)
+        K (np.ndarray): Camera intrinsic matrix (3x3)
+    
+    Returns:
+        E (np.ndarray): Essential matrix (3x3)
+    """
+    if F.shape != (3, 3):
+        raise ValueError(f"F must be 3x3, got {F.shape}")
+    if K.shape != (3, 3):
+        raise ValueError(f"K must be 3x3, got {K.shape}")
+    
+    # E = K^T * F * K
+    E = K.T @ F @ K
+    
+    # Normalize (선택적) → scale factor 무시하고 안정성 확보
+    E /= np.linalg.norm(E)
+
+    return E
+
+# 행렬 K 계산 
+def estimate_K(img1):
+        img1 = os.path.basename(img1)
+        dir = f"filtered_img/filter_{img1}"
+        img1 = cv2.imread(dir)
+        cx = 0
+        cy = 0
+        f = 0
+        h ,w = img1.shape[0], img1.shape[1]
+        f = 1.2 * max(w,h)
+        cx = (w-1) /2
+        cy = (h-1) /2
+        K = np.array([[f, 0.0, cx],
+                  [0.0, f, cy],
+                  [0.0, 0.0, 1.0]], dtype=np.float64)
+
+        return K
+
+
 
 class FeatureExtractor:
     """
@@ -28,7 +85,6 @@ class FeatureExtractor:
         self.database_path = database_path
         if self.image is None:
             raise ValueError(f"Could not read the image at {image_path}")   
-        print(f"Image loaded: {image_path}, size: {self.image.shape[0]}x{self.image.shape[1]}")
 
     def img_filtering(self,out_dir):
         """
@@ -37,7 +93,7 @@ class FeatureExtractor:
         """
         h, w = self.image.shape[:2] 
 
-        print(f"origin completed Image size: {h}x{w}")  # image size and grid size
+        print(f"origin completed {self.jpg_name} Image size: {h}x{w}")  # image size and grid size
 
         # 1) 저장 디렉토리 준비
         os.makedirs(out_dir, exist_ok=True)
@@ -53,7 +109,7 @@ class FeatureExtractor:
 
         return  output  
 
-    def extract_features(self,img,per_cell=50, rows=24, cols=32, y_offset=0,
+    def extract_features(self,img,per_cell=50, rows=24, cols=32,
                          use_rootsift=True, upsample_scale=1.5):
         """
         OpenCV SIFT로 많이 뽑은 뒤, grid별 균일 샘플링을 적용.
@@ -94,7 +150,7 @@ class FeatureExtractor:
 
         # 1) grid 설정
         h, w = img.shape
-        cell_h, cell_w = max(1, h // rows), max(1, w // cols)
+        cell_h, cell_w = max(1, h // rows), max(1, w // cols) 
 
         # 2) 2단계 샘플링: (a) 공간 균형, (b) 전역 상위 보강
         per_cell_hi = per_cell  # 1단계 상한
@@ -113,8 +169,8 @@ class FeatureExtractor:
                 picked.append(i)
                 kept[r, c] += 1
 
-        # (b) 전역 상위 보강 (선택): 남은 예산에서 상위 반응 추가
-        # 예: 목표 총량 cap = rows*cols*per_cell_hi*1.5
+        # (b) 전역 상위 보강: 남은 특징점에서 상위 반응 추가
+        # 예: 목표 총량 cap = rows*cols*per_cell_hi*1.5 (*1.5: 여유있게 설정)
         cap = int(rows * cols * per_cell_hi * 1.5)
         if len(picked) < cap:
             for i in idx_sorted:
@@ -123,6 +179,8 @@ class FeatureExtractor:
                 picked.append(i)
                 if len(picked) >= cap:
                     break
+
+        print(f"|{self.jpg_name}의 총 feature 수: {len(picked)}")
 
         picked = np.array(picked, dtype=int)
 
@@ -135,7 +193,8 @@ class FeatureExtractor:
                 x /= upsample_scale
                 y /= upsample_scale
 
-            xs.append(x); ys.append(y)
+            xs.append(x)
+            ys.append(y)
             scales.append(kp.size)  # COLMAP은 scale(σ)로 사용, size 그대로 넣어도 OK
             angles.append(np.deg2rad(kp.angle if kp.angle is not None else 0.0))
 
@@ -145,18 +204,18 @@ class FeatureExtractor:
         desc = descriptors[picked, :].astype(np.float32)
 
         if use_rootsift:
-            # RootSIFT: L1 normalize → sqrt → (선택)L2 normalize → 512× → uint8
-            desc += 1e-12
+            # RootSIFT: L1 normalize → sqrt → L2 normalize → 512× → uint8
+            desc += 1e-12 # zerodivision error 방지
             desc /= np.sum(desc, axis=1, keepdims=True)   # L1
             desc = np.sqrt(desc)                          # sqrt
-            # desc /= (np.linalg.norm(desc, axis=1, keepdims=True) + 1e-12) # (선택)L2
+            desc /= (np.linalg.norm(desc, axis=1, keepdims=True) + 1e-12) # L2
         else:
             # 안전 L2
             desc /= (np.linalg.norm(desc, axis=1, keepdims=True) + 1e-12)
 
         desc_u8 = np.clip(desc * 512.0, 0, 255).astype(np.uint8).T  # (128,N)
 
-        return kp_xy4, desc_u8, counts_raw
+        return kp_xy4, desc_u8, counts_raw , kept
 
     def ensure_camera(self,db: COLMAPDatabase, model="SIMPLE_RADIAL", width=None, height=None, params=None):
         """
@@ -268,20 +327,23 @@ class FeatureExtractor:
 
         output = A.img_filtering(out_dir)
         
-        kp_xy, desc_u8, table = A.extract_features(output,per_cell=50, rows=24, cols=32)
+        kp_xy, desc_u8, table , kept = A.extract_features(output,per_cell=50, rows=24, cols=32)
         
         print("kp:", kp_xy.shape, "desc:", desc_u8.shape)
         
         A.store_features(f"{out_dir}/filter_{self.jpg_name}.jpg", kp_xy, desc_u8)
 
-
+        # --- table 시각화 및 저장 ---
+        heatmap_path = f"{out_dir}/countraw_{self.jpg_name}.png"
+        save_table_heatmap(table, heatmap_path)
+        keptmap_path = f"{out_dir}/kept_{self.jpg_name}.png"
+        save_table_heatmap(kept, keptmap_path)
 
 # =================================================================================
 # BFMatcher Implementation
 # =================================================================================
-        
 class BFMatcher:
-    def __init__(self, database_path, ratio=0.8, cross_check=True, max_iters: int = 5000,
+    def __init__(self, database_path, ratio=0.9, cross_check=True, max_iters: int = 5000,
                  ransac_th_px=1.0, ransac_conf=0.999, min_matches=8, 
                 rng_seed: int | None = 0,
                 save_two_view_geom: bool = True,):
@@ -289,12 +351,12 @@ class BFMatcher:
         Args:
             database_path: COLMAP database.db 경로
             ratio: Lowe ratio (0.75~0.85 권장)
-            cross_check: 상호검증 사용할지
+            cross_check: 상호검증 사용 여부 
             min_matches: 이보다 적으면 해당 쌍은 저장하지 않음
-            save_two_view_geom: two_view_geometries 테이블까지 기록할지
+            save_two_view_geom: two_view_geometries 테이블까지 기록 여부 (colmap과의 호환성)
         """
         self.database_path = database_path
-        self.ratio = ratio
+        self.ratio = ratio # 두 최근접 매칭의 거리비율
         self.cross_check = cross_check
         self.min_matches = min_matches
         self.conf = ransac_conf
@@ -330,7 +392,8 @@ class BFMatcher:
         """정규화 8-point (x1↔x2: 픽셀좌표, 동일 길이)"""
         x1n, T1 = BFMatcher._normalize_points(x1)
         x2n, T2 = BFMatcher._normalize_points(x2)
-        X = x1n; Xp = x2n  # x (first image), x' (second)
+        X = x1n
+        Xp = x2n  # x (first image), x' (second)
         # A f = 0 구성
         u, v, w  = X[:,0],  X[:,1],  X[:,2]
         up, vp, wp = Xp[:,0], Xp[:,1], Xp[:,2]
@@ -359,7 +422,7 @@ class BFMatcher:
         denom = Fx1[:,0]**2 + Fx1[:,1]**2 + Ftx2[:,0]**2 + Ftx2[:,1]**2 + 1e-12
         return (e**2) / denom  
     
-    def _load_keypoints_descriptors(self, db: COLMAPDatabase, image_id: int):
+    def _load_descriptors(self, db: COLMAPDatabase, image_id: int):
         """
         DB에서 keypoints 로드
         descriptors: (N,128) float32 (L2 정규화)
@@ -400,7 +463,7 @@ class BFMatcher:
             if m.distance < self.ratio * n.distance:
                 cand.append((m.queryIdx, m.trainIdx, m.distance))
 
-        if self.cross_check:
+        if self.cross_check: # 교차 검증
             bf2 = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
             knn_rev = bf2.knnMatch(d1, d0, k=2)
             best_rev = {}
@@ -584,8 +647,8 @@ class BFMatcher:
             num_saved = 0
 
             for (id1, id2, name1, name2) in pairs:
-                d0 = self._load_keypoints_descriptors(db, id1)
-                d1 = self._load_keypoints_descriptors(db, id2)
+                d0 = self._load_descriptors(db, id1)
+                d1 = self._load_descriptors(db, id2)
 
                 matches_ij, conf = self._bf_match(d0, d1)
                 if matches_ij.shape[0] < self.min_matches:
@@ -660,48 +723,7 @@ class BFMatcher:
     
 
 
-# =================================================================================
-# 행렬 E 계산
-def compute_E(F: np.ndarray, K: np.ndarray) -> np.ndarray:
-    """
-    Compute Essential matrix from Fundamental matrix and camera intrinsics.
-    
-    Args:
-        F (np.ndarray): Fundamental matrix (3x3)
-        K (np.ndarray): Camera intrinsic matrix (3x3)
-    
-    Returns:
-        E (np.ndarray): Essential matrix (3x3)
-    """
-    if F.shape != (3, 3):
-        raise ValueError(f"F must be 3x3, got {F.shape}")
-    if K.shape != (3, 3):
-        raise ValueError(f"K must be 3x3, got {K.shape}")
-    
-    # E = K^T * F * K
-    E = K.T @ F @ K
-    
-    # Normalize (선택적) → scale factor 무시하고 안정성 확보
-    E /= np.linalg.norm(E)
 
-    return E
- 
-def estimate_K(img1):
-        img1 = os.path.basename(img1)
-        dir = f"filtered_img/filter_{img1}"
-        img1 = cv2.imread(dir)
-        cx = 0
-        cy = 0
-        f = 0
-        h ,w = img1.shape[0], img1.shape[1]
-        f = 1.2 * max(w,h)
-        cx = (w-1) /2
-        cy = (h-1) /2
-        K = np.array([[f, 0.0, cx],
-                  [0.0, f, cy],
-                  [0.0, 0.0, 1.0]], dtype=np.float64)
-
-        return K
 
 
 # =================================================================================
@@ -747,15 +769,24 @@ if __name__ == "__main__":
         "images/B1/case1/B1_10_18.jpg"]
     img_case3 = [
         "images/B1/02/B1_02_00.jpg",
+        "images/B1/02/B1_02_01.jpg",
+        "images/B1/02/B1_02_02.jpg",
         "images/B1/04/B1_04_00.jpg",
-        "images/B1/05/B1_05_00.jpg"
+        "images/B1/04/B1_04_01.jpg",
+        "images/B1/04/B1_04_02.jpg",
+        "images/B1/05/B1_05_00.jpg",
+        "images/B1/05/B1_05_01.jpg",
+        "images/B1/05/B1_05_02.jpg",
+        "images/B1/08/B1_08_00.jpg",
+        "images/B1/08/B1_08_01.jpg",
+        "images/B1/08/B1_08_02.jpg",
         ]
     
     
-    for img_path in img_case3:
-        A = FeatureExtractor(img_path ,database_path)
-        A.main(img_path)
-        print(f"Feature extraction and storage completed for {os.path.basename(img_path)}") 
+    #for img_path in img_case3:
+       # A = FeatureExtractor(img_path ,database_path)
+       # A.main(img_path)
+       # print(f"Feature extraction and storage completed for {os.path.basename(img_path)}") 
 
     
     matcher = BFMatcher(database_path, ratio=0.8, cross_check=True, max_iters= 5000,
@@ -763,8 +794,8 @@ if __name__ == "__main__":
     
     matcher.match()
 
-    for img1, img2 in itertools.combinations(img_case3, 2):
-        matcher.ransac(img1 , img2, update_db=True)
-        matcher.triangulate_points(img1,img2)
+    #for img1, img2 in itertools.combinations(img_case3, 2):
+       # matcher.ransac(img1 , img2, update_db=True)
+       # matcher.triangulate_points(img1,img2)
 
 
