@@ -90,19 +90,20 @@ class FeatureExtractor:
 
     def img_filtering(self,out_dir):
         """
-        1) grayscale
-        2) CLAHE 
+        1) 노란색 hsv 마스킹
+        2) grayscale
+        3) CLAHE 
         """
         h, w = self.image.shape[:2] 
 
-        print(f"origin completed {self.jpg_name} Image size: {h}x{w}")  # image size and grid size
+        print(f"origin completed {self.jpg_name} Image size: {h}x{w}") 
 
         # 1) 저장 디렉토리 준비
         os.makedirs(out_dir, exist_ok=True)
 
 
         hsv = cv2.cvtColor(self.image, cv2.COLOR_BGR2HSV)
-        # 노랑 범위(필요시 조정)
+        # 노랑 범위
         lower = np.array([15,  60,  60])   # H,S,V
         upper = np.array([40, 255, 255])
         mask  = cv2.inRange(hsv, lower, upper)
