@@ -202,6 +202,58 @@ def build_image_pairs_by_rule(image_paths: list[str],
                                              os.path.basename(image_paths[ij[1]])))
     return pairs
 
+
+def parse_cam_and_frame(path: str) -> tuple[int,int]:
+    """
+    파일명에서 카메라 번호와 프레임 번호를 추출.
+    예) '.../B1_02_00.jpg' -> (2, 0)
+    """
+    stem = os.path.splitext(os.path.basename(path))[0]
+    nums = re.findall(r"\d+", stem)  # ['1','02','00']
+    if len(nums) >= 3:
+        cam = int(nums[1])   # 두 번째 숫자 그룹 → 카메라 번호
+        frame = int(nums[2]) # 세 번째 숫자 그룹 → 프레임 번호
+        return cam, frame
+    raise ValueError(f"Unexpected filename format: {path}")
+
+def build_cctv_pairs(image_paths: list[str]) -> list[tuple[int,int]]:
+    """
+    주차장 CCTV용 페어 생성:
+    - 같은 프레임 번호의 서로 다른 카메라 쌍
+    - 같은 카메라의 연속 프레임 쌍
+    """
+    # (cam, frame) → 인덱스 매핑
+    cam_frame_to_idx = {}
+    cam_to_frames = defaultdict(list)
+    frame_to_cams = defaultdict(list)
+
+    for idx, p in enumerate(image_paths):
+        cam, frame = parse_cam_and_frame(p)
+        cam_frame_to_idx[(cam, frame)] = idx
+        cam_to_frames[cam].append((frame, idx))
+        frame_to_cams[frame].append((cam, idx))
+
+    pairs = set()
+
+    # 1) 같은 프레임에서 서로 다른 카메라 쌍
+    for frame, lst in frame_to_cams.items():
+        for i in range(len(lst)):
+            for j in range(i+1, len(lst)):
+                pairs.add(tuple(sorted((lst[i][1], lst[j][1]))))
+
+    # 2) 같은 카메라의 연속 프레임 쌍
+    for cam, lst in cam_to_frames.items():
+        lst_sorted = sorted(lst, key=lambda x: x[0])  # frame 번호 순으로 정렬
+        for (f1, i1), (f2, i2) in zip(lst_sorted, lst_sorted[1:]):
+            if f2 == f1 + 1:  # 연속 프레임일 때만
+                pairs.add(tuple(sorted((i1, i2))))
+
+    # 정렬
+    pairs = sorted(pairs, key=lambda ij: (os.path.basename(image_paths[ij[0]]),
+                                          os.path.basename(image_paths[ij[1]])))
+    return pairs
+
+
 # --------- F/H 동시 추정 + 선택 ----------
 def robust_F_or_H(xA: np.ndarray, xB: np.ndarray,
                   th_px: float = 1.8, conf: float = 0.999):
@@ -727,8 +779,10 @@ def run_sfm_and_ba(image_root: str,
                                  exclude_dirs=("filtered", ".cache", ".git"))
     assert len(image_paths) >= 2
     feats = build_features(image_paths)
-    pairs = build_image_pairs_by_rule(image_paths, allowed_pairs={(2,5),(4,8),(4,5),(7,8)})
+    # 카메라=5대, 각 40프레임 가정
+    pairs = build_cctv_pairs(image_paths)
     recon = reconstruct_sfm(image_paths, feats, refine_focal=refine_focal, image_pairs=pairs)
+
 
     pts = recon['points3d']
     if pts.shape[0] > 0:
