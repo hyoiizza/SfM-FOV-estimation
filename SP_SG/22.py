@@ -155,25 +155,26 @@ def sg_match(grayA_u8: np.ndarray, grayB_u8: np.ndarray,
     return xA.astype(np.float64), xB.astype(np.float64), c.astype(np.float32)
 
 
-def _extract_mid_code_by_name(path: str) -> int | None:
-    """
-    예) 'B1_02_00.jpg' -> 가운데 숫자 '02'를 int(2)로 반환
-    """
-    stem = os.path.splitext(os.path.basename(path))[0]
-    nums = re.findall(r"\d+", stem)          # ['1','02','00'] 같은 꼴
-    if len(nums) >= 2:
-        try:
-            return int(nums[1])
-        except ValueError:
-            return None
-    return None
-
+# --------- matching 규칙 1 ------------------
 def build_image_pairs_by_rule(image_paths: list[str],
                               allowed_pairs: set[tuple[int,int]] = {(2,5), (4,8), (4,5)}) -> list[tuple[int,int]]:
     """
     파일명 규칙(가운데 숫자) 기반 허용 조합으로만 (i,j) 인덱스 페어 생성.
     반환: (i<j) 보장된 인덱스 쌍 리스트 (정렬됨)
     """
+    def _extract_mid_code_by_name(path: str) -> int | None:
+        """
+        예) 'B1_02_00.jpg' -> 가운데 숫자 '02'를 int(2)로 반환
+        """
+        stem = os.path.splitext(os.path.basename(path))[0]
+        nums = re.findall(r"\d+", stem)          # ['1','02','00'] 같은 꼴
+        if len(nums) >= 2:
+            try:
+                return int(nums[1])
+            except ValueError:
+                return None
+        return None
+
     # (5,4) == (4,5) 로 정규화
     allowed_pairs = {tuple(sorted(p)) for p in allowed_pairs}
 
@@ -202,26 +203,33 @@ def build_image_pairs_by_rule(image_paths: list[str],
                                              os.path.basename(image_paths[ij[1]])))
     return pairs
 
-
-def parse_cam_and_frame(path: str) -> tuple[int,int]:
-    """
-    파일명에서 카메라 번호와 프레임 번호를 추출.
-    예) '.../B1_02_00.jpg' -> (2, 0)
-    """
-    stem = os.path.splitext(os.path.basename(path))[0]
-    nums = re.findall(r"\d+", stem)  # ['1','02','00']
-    if len(nums) >= 3:
-        cam = int(nums[1])   # 두 번째 숫자 그룹 → 카메라 번호
-        frame = int(nums[2]) # 세 번째 숫자 그룹 → 프레임 번호
-        return cam, frame
-    raise ValueError(f"Unexpected filename format: {path}")
-
-def build_cctv_pairs(image_paths: list[str]) -> list[tuple[int,int]]:
+# ---------- matching 규칙 2 ---------------
+def build_cctv_pairs(image_paths: list[str],
+    allowed_cam_pairs: set[tuple[int,int]] | None = None,
+    include_same_cam_consecutive: bool = True
+    ) -> list[tuple[int,int]]:
     """
     주차장 CCTV용 페어 생성:
     - 같은 프레임 번호의 서로 다른 카메라 쌍
     - 같은 카메라의 연속 프레임 쌍
     """
+    def parse_cam_and_frame(path: str) -> tuple[int,int]:
+        """
+        파일명에서 카메라 번호와 프레임 번호를 추출.
+        예) '.../B1_02_00.jpg' -> (2, 0)
+        """
+        stem = os.path.splitext(os.path.basename(path))[0]
+        nums = re.findall(r"\d+", stem)  # ['1','02','00']
+        if len(nums) >= 3:
+            cam = int(nums[1])   # 두 번째 숫자 그룹 → 카메라 번호
+            frame = int(nums[2]) # 세 번째 숫자 그룹 → 프레임 번호
+            return cam, frame
+        raise ValueError(f"Unexpected filename format: {path}")
+    
+    allowed_norm = None
+    if allowed_cam_pairs is not None:
+        allowed_norm = {tuple(sorted(p)) for p in allowed_cam_pairs}
+        
     # (cam, frame) → 인덱스 매핑
     cam_frame_to_idx = {}
     cam_to_frames = defaultdict(list)
@@ -234,13 +242,21 @@ def build_cctv_pairs(image_paths: list[str]) -> list[tuple[int,int]]:
         frame_to_cams[frame].append((cam, idx))
 
     pairs = set()
-
-    # 1) 같은 프레임에서 서로 다른 카메라 쌍
+                
+    # 1) 같은 frame에서 서로 다른 카메라 쌍 (allowed_cam_pairs 적용)
     for frame, lst in frame_to_cams.items():
-        for i in range(len(lst)):
-            for j in range(i+1, len(lst)):
-                pairs.add(tuple(sorted((lst[i][1], lst[j][1]))))
-
+        # lst: [(cam, idx), ...]
+        n = len(lst)
+        for a in range(n):
+            cam_a, idx_a = lst[a]
+            for b in range(a+1, n):
+                cam_b, idx_b = lst[b]
+                # allowed 필터
+                if allowed_norm is not None and tuple(sorted((cam_a, cam_b))) not in allowed_norm:
+                    continue
+                i, j = (idx_a, idx_b) if idx_a < idx_b else (idx_b, idx_a)
+                pairs.add((i, j))
+                
     # 2) 같은 카메라의 연속 프레임 쌍
     for cam, lst in cam_to_frames.items():
         lst_sorted = sorted(lst, key=lambda x: x[0])  # frame 번호 순으로 정렬
@@ -780,8 +796,17 @@ def run_sfm_and_ba(image_root: str,
     assert len(image_paths) >= 2
     feats = build_features(image_paths)
     # 카메라=5대, 각 40프레임 가정
-    pairs = build_cctv_pairs(image_paths)
-    recon = reconstruct_sfm(image_paths, feats, refine_focal=refine_focal, image_pairs=pairs)
+    allowed_cam_pairs = {(2,5), (4,8), (4,5), (7,8)}
+    
+    pairs = build_cctv_pairs(
+        image_paths,
+        allowed_cam_pairs=allowed_cam_pairs,          # 동시간대 카메라쌍 필터
+        include_same_cam_consecutive=True             # 동일카메라 연속프레임도 사용
+    )
+
+    recon = reconstruct_sfm(image_paths, feats,
+                            refine_focal=refine_focal,
+                            image_pairs=pairs)
 
 
     pts = recon['points3d']
