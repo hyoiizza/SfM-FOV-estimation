@@ -205,15 +205,55 @@ def build_image_pairs_by_rule(image_paths: list[str],
 # --------- F/H 동시 추정 + 선택 ----------
 def robust_F_or_H(xA: np.ndarray, xB: np.ndarray,
                   th_px: float = 1.8, conf: float = 0.999):
-    F, inlF = cv2.findFundamentalMat(xA, xB, cv2.USAC_MAGSAC, ransacReprojThreshold=th_px, confidence=conf)
-    H, inlH = cv2.findHomography   (xA, xB, cv2.USAC_MAGSAC, ransacReprojThreshold=th_px, confidence=conf)
+    # 0) 기본 전처리: dtype/contiguous/유한값/중복 제거
+    xA = np.ascontiguousarray(xA, dtype=np.float64)
+    xB = np.ascontiguousarray(xB, dtype=np.float64)
+    finite = np.isfinite(xA).all(axis=1) & np.isfinite(xB).all(axis=1)
+    xA, xB = xA[finite], xB[finite]
+    if xA.shape[0] < 8:
+        return "F", None, None  # F 추정 불가
+
+    # 중복 제거(동일 좌표쌍 제거)
+    pairs = np.hstack([xA, xB])
+    _, keep = np.unique(pairs, axis=0, return_index=True)
+    xA, xB = xA[keep], xB[keep]
+    if xA.shape[0] < 8:
+        return "F", None, None
+
+    # 1) F/H 둘 다 시도하되, 실패/예외는 건너뛰기
+    F, inlF = None, None
+    H, inlH = None, None
+    try:
+        F, inlF = cv2.findFundamentalMat(
+            xA, xB, cv2.USAC_MAGSAC, ransacReprojThreshold=th_px, confidence=conf
+        )
+    except cv2.error:
+        F, inlF = None, None
+
+    try:
+        H, inlH = cv2.findHomography(
+            xA, xB, cv2.USAC_MAGSAC, ransacReprojThreshold=th_px, confidence=conf
+        )
+    except cv2.error:
+        H, inlH = None, None
+
     cntF = int(inlF.sum()) if inlF is not None else 0
     cntH = int(inlH.sum()) if inlH is not None else 0
-    if cntH >= 1.5 * cntF:
-        model, M, inliers = "H", H, inlH
+
+    # 2) 둘 다 실패면 F=RANSAC로 다운그레이드 (USAC이 종종 assert로 죽는 페어 방지)
+    if F is None and H is None:
+        try:
+            F, inlF = cv2.findFundamentalMat(xA, xB, cv2.FM_RANSAC, th_px, conf)
+            cntF = int(inlF.sum()) if inlF is not None else 0
+        except cv2.error:
+            return "F", None, None
+
+    # 3) 선택 규칙
+    if cntH >= 1.5 * cntF and H is not None:
+        return "H", H, inlH
     else:
-        model, M, inliers = "F", F, inlF
-    return model, M, inliers
+        return "F", F, inlF
+
 
 # ---------  E/R/t 추정 ----------
 def pose_from_F(F: np.ndarray, xA: np.ndarray, xB: np.ndarray, K: np.ndarray):
@@ -386,11 +426,11 @@ def _build_jacobian_sparsity(num_cams: int, num_pts: int,
 # ===== reconstruct_sfm 재정의: BA 부분을 희소-TRF로 교체 + 포인트 다운샘플 =====
 def reconstruct_sfm(image_paths: list[str], feats: dict,
                     refine_focal: bool = False,
-                    pnp_min_pts: int = 30,
+                    pnp_min_pts: int = 15,
                     min_inliers_seed: int = 20,
-                    min_tri_deg: float = 1.0,
+                    min_tri_deg: float = 0.5,
                     min_cheir_ratio: float = 0.55,
-                    sg_topk: int = 2000,
+                    sg_topk: int = 4000,
                     image_pairs: list[tuple[int,int]] | None = None) -> dict:
     # ---------- 내부 유틸 ----------
     @torch.inference_mode()
@@ -480,7 +520,7 @@ def reconstruct_sfm(image_paths: list[str], feats: dict,
         xA, xB, _, idA, idB = _sg_match_safe(fa, fb, sg_topk)
         if xA.shape[0] < 8: 
             continue
-        model, M, inliers = robust_F_or_H(xA, xB, th_px=2.2, conf=0.999)
+        model, M, inliers = robust_F_or_H(xA, xB, th_px=2.5, conf=0.999)
         if model != "F" or inliers is None: 
             continue
         inl = inliers.ravel().astype(bool)
@@ -601,7 +641,7 @@ def reconstruct_sfm(image_paths: list[str], feats: dict,
         if new_total>0:
             L(f"[SfM] View {k} triangulated new points: {new_total} | total={len(lm)}")
 
-    # ---------- 희소 BA (동일) ----------
+    # ---------- 희소 BA ----------
     cam_indices = sorted(cams.keys())
     cam_id_to_slot = {cid:s for s,cid in enumerate(cam_indices)}
     obs_cam_slot = np.array([cam_id_to_slot[c] for (c,_,_) in obs], np.int32)
@@ -701,4 +741,5 @@ def run_sfm_and_ba(image_root: str,
 if __name__ == "__main__":
     
     run_sfm_and_ba(image_root="images", pattern="**/**/*.jpg",
-                   refine_focal=False, ply_path="recon.ply")
+                   refine_focal=True, ply_path="recon.ply")
+    
